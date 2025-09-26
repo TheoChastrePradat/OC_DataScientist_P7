@@ -87,6 +87,10 @@ def prepare_dataframe(features: dict | list[dict]) -> tuple[pd.DataFrame, list[s
 
     # Réordonne exactement comme à l'entraînement
     df = df[EXPECTED_FEATURES]
+
+    # Convertit tout en numérique (strings -> NaN), puis cast en float32
+    df = df.apply(pd.to_numeric, errors="coerce").astype(np.float32)
+
     return df, missing, extra
 
 def class_label(pred_int: int) -> str:
@@ -105,6 +109,18 @@ def health():
         "model_path": str(MODEL_PATH),
         "meta_path": str(META_PATH),
     }
+
+
+@app.get("/metadata")
+def metadata():
+    return {
+        "model_version": MODEL_VERSION,
+        "threshold": THRESHOLD,
+        "n_features": len(EXPECTED_FEATURES),
+        "expected_features": EXPECTED_FEATURES,  # ordre exact d’entraînement
+        "class_mapping": CLASS_MAPPING,
+    }
+
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):

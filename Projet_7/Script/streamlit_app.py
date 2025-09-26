@@ -45,15 +45,22 @@ go = st.button("Prédire")
 
 # Outils
 def row_to_payload(row: pd.Series) -> dict:
-    # on retire l'ID et on envoie toutes les features restantes
-    payload = {"features": row.drop(labels=[ID_COL]).to_dict()}
-    
-    for k, v in list(payload["features"].items()):
+    d = row.drop(labels=["SK_ID_CURR"]).to_dict()
+    clean = {}
+    for k, v in d.items():
         if pd.isna(v):
-            payload["features"][k] = None  # l’API mettra NaN
-        elif hasattr(v, "item"):          # numpy scalar
-            payload["features"][k] = v.item()
-    return payload
+            clean[k] = None
+        elif hasattr(v, "item"):
+            clean[k] = v.item()              # numpy -> python
+        elif isinstance(v, (bool, int, float)):
+            clean[k] = v
+        else:
+            # dernier recours: tenter float, sinon None
+            try:
+                clean[k] = float(v)
+            except Exception:
+                clean[k] = None
+    return {"features": clean}
 
 
 if go:
@@ -88,7 +95,10 @@ if go:
                     st.info(f"Features manquantes remplies (NaN): {len(res['missing_features'])}")
                 if res.get("extra_features"):
                     st.info(f"Features ignorées: {res['extra_features']}")
-            except Exception as e:
+            except requests.HTTPError as e:
+                # Affiche le corps renvoyé par FastAPI
+                st.error(f"{e}\n{r.text}")
+            except Exception as e: 
                 st.error(e)
 
-st.caption(f"API: {API_URL_LOCAL} · Lignes: {len(df)} · Colonnes: {len(df.columns)}")
+st.caption(f"API: {API_URL_LOCAL}/docs · Lignes: {len(df)} · Colonnes: {len(df.columns)}")
