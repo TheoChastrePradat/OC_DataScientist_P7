@@ -10,13 +10,14 @@ import pandas as pd
 from pathlib import Path
 from pydantic import BaseModel, Field
 from fastapi import HTTPException
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # chemins dossier artifacts
 ART_DIR       = Path(os.getenv("ART_DIR", "artifacts"))
 MODEL_PATH    = Path(os.getenv("MODEL_PATH", ART_DIR / "model.joblib"))
 META_PATH     = Path(os.getenv("ARTIFACTS_PATH", ART_DIR / "artifacts.json"))
-OVERRIDE_THR  = os.getenv("THRESHOLD")  # optionnel pour tester un autre seuil
+OVERRIDE_THR  = os.getenv("THRESHOLD")
 
 # chargement des artefacts au démarrage
 model = joblib.load(MODEL_PATH)
@@ -57,16 +58,16 @@ class PredictRequest(BaseModel):
     )
 
 class PredictBatchRequest(BaseModel):
-    # Liste de lignes : chaque élément est un dict {feature: valeur}
+    # Liste de lignes, chaque élément est un dict {feature: valeur}
     rows: list[dict]
 
 class PredictResponse(BaseModel):
     probability: float
     threshold: float
-    predicted_class: int            # 1 = "Refuser", 0 = "Accepter"
-    decision: str                   # libellé lisible
-    missing_features: list[str] = []  # colonnes manquantes (remplies par NaN)
-    extra_features: list[str] = []    # colonnes ignorées
+    predicted_class: int # 1 = "Refuser", 0 = "Accepter"
+    decision: str
+    missing_features: list[str] = []
+    extra_features: list[str] = []
     model_version: str
 
 class PredictBatchResponse(BaseModel):
@@ -84,7 +85,8 @@ def prepare_dataframe(features: dict | list[dict]) -> tuple[pd.DataFrame, list[s
     extra   = [c for c in df.columns if c not in EXPECTED_FEATURES]
 
     for c in missing:
-        df[c] = np.nan  # LGBM gère NaN nativement
+        # LGBM gère NaN nativement
+        df[c] = np.nan
 
     # Réordonne exactement comme à l'entraînement
     df = df[EXPECTED_FEATURES]
@@ -97,6 +99,12 @@ def prepare_dataframe(features: dict | list[dict]) -> tuple[pd.DataFrame, list[s
 def class_label(pred_int: int) -> str:
     # 1 -> "Refuser", 0 -> "Accepter"
     return "❌ Refuser" if pred_int == CLASS_MAPPING.get("Refuser", 1) else "✅ Accepter"
+
+# route par défaut, redirige vers la doc interactive
+@app.get("/")
+def root():
+    return RedirectResponse(url="/docs", status_code=302)
+
 
 # endpoints API
 @app.get("/health")
