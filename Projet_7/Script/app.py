@@ -1,3 +1,5 @@
+from fastapi import FastAPI
+
 import os
 import json
 import joblib
@@ -7,7 +9,6 @@ import pandas as pd
 
 from pathlib import Path
 from pydantic import BaseModel, Field
-from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
