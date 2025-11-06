@@ -21,6 +21,14 @@ META_PATH    = Path(os.getenv("ARTIFACTS_PATH", ART_DIR / "artifacts.json"))
 OVERRIDE_THR = os.getenv("THRESHOLD")
 SKIP_MODEL   = os.getenv("SKIP_MODEL_LOAD", "0") == "1"  # utile pour la CI
 
+# Mode mock pour la CI
+class _DummyModel:
+    """Renvoie proba_refus = 0 pour simplifier les tests CI."""
+    def predict_proba(self, X):
+        n = len(X)
+        proba_refus = np.zeros(n, dtype=np.float32)
+        return np.c_[1 - proba_refus, proba_refus]
+
 # État global (lazy)
 _model: Optional[Any] = None
 _meta: Dict[str, Any] = {}
@@ -34,6 +42,7 @@ def _load_meta_if_needed() -> None:
     global _meta, EXPECTED_FEATURES, THRESHOLD, MODEL_VERSION, CLASS_MAPPING
     if _meta:
         return
+
     try:
         with open(META_PATH, "r", encoding="utf-8") as f:
             _meta = json.load(f)
@@ -42,11 +51,11 @@ def _load_meta_if_needed() -> None:
         THRESHOLD = float(OVERRIDE_THR) if OVERRIDE_THR is not None else thr
         MODEL_VERSION = _meta.get("model_version", "v1")
         CLASS_MAPPING = _meta.get("class_mapping", {"Accepter": 0, "Refuser": 1})
-    except Exception as e:
+    except Exception:
         if SKIP_MODEL:
             # Valeurs par défaut en CI si les artefacts ne sont pas présents
             _meta = {}
-            EXPECTED_FEATURES = []
+            EXPECTED_FEATURES = ["EXT_SOURCE_1", "EXT_SOURCE_2", "PAYMENT_RATE"]
             THRESHOLD = float(OVERRIDE_THR) if OVERRIDE_THR is not None else 0.5
             MODEL_VERSION = "ci"
             CLASS_MAPPING = {"Accepter": 0, "Refuser": 1}
@@ -54,11 +63,14 @@ def _load_meta_if_needed() -> None:
             raise
 
 def _load_model_if_needed() -> None:
-    """Charge le modèle au premier accès, sauf si SKIP_MODEL_LOAD=1."""
+    """Charge le modèle au premier accès, ou un DummyModel si SKIP_MODEL_LOAD=1."""
     global _model
-    if _model is not None or SKIP_MODEL:
+    if _model is not None:
         return
-    _model = joblib.load(MODEL_PATH)
+    if SKIP_MODEL:
+        _model = _DummyModel()
+    else:
+        _model = joblib.load(MODEL_PATH)
 
 # FastAPI app
 app = FastAPI(
@@ -74,7 +86,6 @@ app.add_middleware(
 )
 
 # Schémas d'E/S
-
 class PredictRequest(BaseModel):
     features: dict = Field(
         ...,
@@ -88,7 +99,7 @@ class PredictRequest(BaseModel):
     )
 
 class PredictBatchRequest(BaseModel):
-    rows: list[dict]  # chaque élément est un dict
+    rows: list[dict] # chaque élément est un dict
 
 class PredictResponse(BaseModel):
     # éviter le warning "model_" namespace protégé
@@ -96,10 +107,10 @@ class PredictResponse(BaseModel):
 
     probability: float
     threshold: float
-    predicted_class: int            # 1 = "Refuser", 0 = "Accepter"
-    decision: str                   # libellé lisible
-    missing_features: list[str] = []  # colonnes manquantes
-    extra_features: list[str] = []    # colonnes ignorées
+    predicted_class: int # 1 = "Refuser", 0 = "Accepter"
+    decision: str # libellé lisible
+    missing_features: list[str] = [] # colonnes manquantes
+    extra_features: list[str] = [] # colonnes ignorées
     model_version: str
 
 class PredictBatchResponse(BaseModel):
@@ -107,7 +118,6 @@ class PredictBatchResponse(BaseModel):
     results: list[PredictResponse]
 
 # Helpers
-
 def prepare_dataframe(features: dict | list[dict]) -> Tuple[pd.DataFrame, List[str], List[str]]:
     """Aligne les features sur EXPECTED_FEATURES, ajoute les manquantes (NaN), ignore les extra."""
     _load_meta_if_needed()
@@ -138,7 +148,6 @@ def class_label(pred_int: int) -> str:
     return "❌ Refuser" if pred_int == CLASS_MAPPING.get("Refuser", 1) else "✅ Accepter"
 
 # Routes
-
 @app.get("/")
 def root():
     # redirige vers la doc interactive Swagger
@@ -147,6 +156,11 @@ def root():
 @app.get("/health")
 def health():
     _load_meta_if_needed()
+    # si on n’a pas encore accédé au modèle, tente un chargement paresseux
+    try:
+        _load_model_if_needed()
+    except Exception:
+        pass
     return {
         "status": "ok",
         "model_version": MODEL_VERSION,
@@ -166,7 +180,7 @@ def metadata():
         "model_version": MODEL_VERSION,
         "threshold": THRESHOLD,
         "n_features": len(EXPECTED_FEATURES),
-        "expected_features": EXPECTED_FEATURES,  # ordre exact d’entraînement
+        "expected_features": EXPECTED_FEATURES, # ordre exact d’entraînement
         "class_mapping": CLASS_MAPPING,
     }
 
@@ -175,11 +189,9 @@ def predict(req: PredictRequest):
     try:
         _load_meta_if_needed()
         _load_model_if_needed()
-        if _model is None:
-            raise RuntimeError("Modèle non chargé (SKIP_MODEL_LOAD=1 ?)")
         X, missing, extra = prepare_dataframe(req.features)
         proba_bad = float(_model.predict_proba(X)[:, 1][0])   # colonne 1 = classe "Refuser"
-        yhat = int(proba_bad >= THRESHOLD)                   # 1 = Refuser, 0 = Accepter
+        yhat = int(proba_bad >= THRESHOLD) # 1 = Refuser, 0 = Accepter
         return PredictResponse(
             probability=proba_bad,
             threshold=THRESHOLD,
@@ -197,8 +209,6 @@ def predict_batch(req: PredictBatchRequest):
     try:
         _load_meta_if_needed()
         _load_model_if_needed()
-        if _model is None:
-            raise RuntimeError("Modèle non chargé (SKIP_MODEL_LOAD=1 ?)")
         X, missing, extra = prepare_dataframe(req.rows)
         probas = _model.predict_proba(X)[:, 1]
         preds = (probas >= THRESHOLD).astype(int)
