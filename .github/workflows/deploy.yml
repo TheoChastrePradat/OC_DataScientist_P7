@@ -1,18 +1,28 @@
-name: CI-CD API to Render
+name: CI-CD API
 
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch: {}
+    paths:
+      - "Projet_7/Script/**"
+      - ".github/workflows/deploy.yml"
+      - "requirements.txt"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+concurrency:
+  group: api-deploy-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test-and-deploy:
+  test:
+    name: Run unit tests (pytest)
     runs-on: ubuntu-latest
-
     defaults:
       run:
         working-directory: Projet_7/Script
-
+    env:
+        SKIP_MODEL_LOAD: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,29 +32,65 @@ jobs:
         with:
           python-version: "3.10"
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('Projet_7/Script/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest httpx
+          pip install pytest
 
-      # (Optionnel mais recommandé) Smoke tests rapides
-      - name: Smoke test FastAPI locally
+      - name: Run pytest
+        env:
+          SKIP_MODEL_LOAD: "1"
         run: |
-          # lance l'app en arrière-plan
-          python -m uvicorn app:app --host 127.0.0.1 --port 8000 &
-          PID=$!
-          sleep 3
-          # ping endpoints clés
-          curl -sSf http://127.0.0.1:8000/health | head -c 200
-          curl -sSf http://127.0.0.1:8000/metadata | head -c 200
-          kill $PID || true
+          pytest -q
 
-      # Si tu ajoutes des vrais tests pytest plus tard, décommente :
-      # - name: Run tests
-      #   run: pytest -q
-
+  deploy:
+    name: Deploy to Render
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    steps:
       - name: Trigger Render deploy
-        if: success()
         run: |
-          curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
+          curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
+
+      - name: Install jq (for JSON assertions)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Smoke test /health (poll until 200)
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }} # https://credit-scoring-api-8j5p.onrender.com
+        run: |
+          echo "Polling $API_BASE_URL/health…"
+          for i in {1..40}; do
+            code=$(curl -s -H "Accept: application/json" -o /tmp/health.json -w "%{http_code}" "$API_BASE_URL/health" || true)
+            if [ "$code" = "200" ]; then
+              echo "Health OK (200)"
+              cat /tmp/health.json
+              exit 0
+            fi
+            echo "Attempt $i: got $code, retrying…"
+            sleep 3
+          done
+          echo "Smoke test /health FAILED"
+          echo "Last body:"; cat /tmp/health.json || true
+          exit 1
+
+      - name: Smoke test /metadata (structure)
+        if: ${{ success() }}
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+        run: |
+          body=$(curl -fsS -H "Accept: application/json" "$API_BASE_URL/metadata")
+          echo "$body" | jq -e '.n_features > 0 and (.expected_features | length > 0)'
+          echo "Metadata OK"
