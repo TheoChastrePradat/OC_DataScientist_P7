@@ -2,8 +2,9 @@ import os
 import pandas as pd
 import requests
 import streamlit as st
+from pathlib import Path
 
-API_URL_LOCAL = st.secrets.get("API_URL_LOCAL", "http://127.0.0.1:8000")
+API_URL = st.secrets.get("API_URL", "https://credit-scoring-api-8j5p.onrender.com")
 
 st.set_page_config(page_title="Credit Scoring App", page_icon="💳", layout="centered")
 st.title("Credit Default Scoring - API")
@@ -16,7 +17,7 @@ with c1:
     """)
     if st.button("Ping API"):
         try:
-            info = requests.get(f"{API_URL_LOCAL}/health", timeout=5).json()
+            info = requests.get(f"{API_URL}/health", timeout=5).json()
             if info.get("status") == "ok":
                 st.success(f"API OK · {info['model_version']} · seuil={info['threshold']}")
             else:
@@ -101,4 +102,17 @@ if go:
             except Exception as e: 
                 st.error(e)
 
-st.caption(f"API: {API_URL_LOCAL}/docs · Lignes: {len(df)} · Colonnes: {len(df.columns)}")
+st.caption(f"API: {API_URL}/docs · Lignes: {len(df)} · Colonnes: {len(df.columns)}")
+
+
+# rapport HTML data drift
+st.header("Data Drift")
+
+REPORT_PATH = Path(__file__).parent / "artifacts" / "evidently" / "evidently_data_drift_report.html"
+
+if REPORT_PATH.exists():
+    with open(REPORT_PATH, "r", encoding="utf-8") as f:
+        html = f.read()
+    st.components.v1.html(html, height=900, scrolling=True)
+else:
+    st.info("Aucun rapport trouvé. Lance d’abord:  `python generate_drift_report.py`")
