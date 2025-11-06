@@ -1,4 +1,7 @@
 import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 os.environ["SKIP_MODEL_LOAD"] = "1"
 
