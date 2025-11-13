@@ -267,7 +267,7 @@ def predict_batch(req: PredictBatchRequest):
 @app.post("/explain", response_model=ExplainResponse)
 def explain(req: ExplainRequest):
     try:
-        _load_metea_if_needed()
+        _load_meta_if_needed()
         _load_model_if_needed()
         _load_explainer_if_needed()
 
