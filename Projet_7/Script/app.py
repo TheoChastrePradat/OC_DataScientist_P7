@@ -123,7 +123,7 @@ def _load_explainer_if_needed():
         bg = _load_background_if_needed()
         masker = shap.maskers.Independent(data=bg)
         # donne les valeurs en proba
-        _explainer = shap.TreeExplainer(_model, masker=masker, model_output="probability", feature_perturbation="interventional")
+        _explainer = shap.TreeExplainer(_model, masker=masker, model_output="raw", feature_perturbation="tree_path_dependent")
 
 # FastAPI app
 app = FastAPI(
@@ -307,8 +307,8 @@ def explain(req: ExplainRequest):
             te = shap.TreeExplainer(
                 _model,
                 data=_load_background_if_needed(),
-                feature_perturbation="interventional",
-                model_output="probability"
+                model_output="raw",
+                feature_perturbation="tree_path_dependent"
             )
 
             vals = te.shap_values(X)
