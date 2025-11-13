@@ -305,7 +305,8 @@ def explain(req: ExplainRequest):
 
         except Exception as e:
             te = shap.TreeExplainer(
-                _model, data=_load_background_df(),
+                _model,
+                data=_load_background_if_needed(),
                 feature_perturbation="interventional",
                 model_output="probability"
             )
