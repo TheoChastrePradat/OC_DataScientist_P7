@@ -21,6 +21,7 @@ MODEL_PATH   = Path(os.getenv("MODEL_PATH", ART_DIR / "model.joblib"))
 META_PATH    = Path(os.getenv("ARTIFACTS_PATH", ART_DIR / "artifacts.json"))
 OVERRIDE_THR = os.getenv("THRESHOLD")
 SKIP_MODEL   = os.getenv("SKIP_MODEL_LOAD", "0") == "1"  # utile pour la CI
+BG_PATH = ART_DIR / "shap_background.parquet"
 
 _explainer = None
 
@@ -95,6 +96,21 @@ def _load_model_if_needed() -> None:
     else:
         _model = joblib.load(MODEL_PATH)
 
+def _load_background_if_needed() -> pd.DataFrame:
+    """
+    Charge le dataset de background pour SHAP
+    """
+    if BG_PATH.exists():
+        bg = pd.read_parquet(BG_PATH)
+
+        for c in EXPECTED_FEATURES:
+            if c not in bg.columns:
+                bg[c] = np.nan
+        bg = bg[EXPECTED_FEATURES].apply(pd.to_numeric, errors="coerce").astype(np.float32)
+        return bg
+    
+    med = pd.Series({c: 0.0 for c in EXPECTED_FEATURES}, dtype=np.float32)
+    return pd.DataFrame([med])[EXPECTED_FEATURES]
 
 def _load_explainer_if_needed():
     """
@@ -102,9 +118,12 @@ def _load_explainer_if_needed():
     """
     global _explainer
     _load_model_if_needed()
+    _load_meta_if_needed()
     if _explainer is None and _model is not None:
+        bg = _load_background_if_needed()
+        masker = shap.maskers.Independent(data=bg)
         # donne les valeurs en proba
-        _explainer = shap.TreeExplainer(_model, model_output="probability", feature_perturbation="interventional")
+        _explainer = shap.TreeExplainer(_model, masker=masker, model_output="probability", feature_perturbation="interventional")
 
 # FastAPI app
 app = FastAPI(
@@ -278,10 +297,24 @@ def explain(req: ExplainRequest):
         
         X, missing, extra = prepare_dataframe(req.features)
 
-        sv = _explainer.shap_values(X)
+        try:
+            exp = _explainer.shap_values(X, check_additivity=False)
 
-        shap_row = sv[0]
-        base_value = float(_explainer.expected_value)
+            shap_row = exp.values[0]
+            base_value = float(exp.base_values[0])
+
+        except Exception as e:
+            te = shap.TreeExplainer(
+                _model, data=_load_background_df(),
+                feature_perturbation="interventional",
+                model_output="probability"
+            )
+
+            vals = te.shap_values(X)
+            shaop_row = np.asarray(vals[1])[0]
+            ev = te.expected_value
+            base_value = float(ev[1] if isinstance(ev, (list, np.ndarray)) else ev)
+
         pred = float(_model.predict_proba(X)[:, 1][0])
 
         # table des contributions
