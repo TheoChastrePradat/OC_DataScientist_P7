@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import os
+import shap
 import json
 import joblib
 import numpy as np
@@ -21,13 +22,31 @@ META_PATH    = Path(os.getenv("ARTIFACTS_PATH", ART_DIR / "artifacts.json"))
 OVERRIDE_THR = os.getenv("THRESHOLD")
 SKIP_MODEL   = os.getenv("SKIP_MODEL_LOAD", "0") == "1"  # utile pour la CI
 
+_explainer = None
+
 # Mode mock pour la CI
 class _DummyModel:
-    """Renvoie proba_refus = 0 pour simplifier les tests CI."""
+    """
+    Renvoie proba_refus = 0 pour simplifier les tests CI
+    """
     def predict_proba(self, X):
         n = len(X)
         proba_refus = np.zeros(n, dtype=np.float32)
         return np.c_[1 - proba_refus, proba_refus]
+
+
+class ExplainRequest(BaseModel):
+    features: dict
+    top_k: int = 10
+
+
+class ExplainResponse(BaseModel):
+    base_value: float
+    prediction: float
+    contribution: List[Dict]
+    model_version: str
+    threshold: float
+
 
 # État global (lazy)
 _model: Optional[Any] = None
@@ -38,7 +57,9 @@ MODEL_VERSION: str = "v1"
 CLASS_MAPPING: Dict[str, int] = {"Accepter": 0, "Refuser": 1}
 
 def _load_meta_if_needed() -> None:
-    """Charge les métadonnées (seuil, features, mapping) au premier accès."""
+    """
+    Charge les métadonnées (seuil, features, mapping) au premier accès
+    """
     global _meta, EXPECTED_FEATURES, THRESHOLD, MODEL_VERSION, CLASS_MAPPING
     if _meta:
         return
@@ -63,7 +84,9 @@ def _load_meta_if_needed() -> None:
             raise
 
 def _load_model_if_needed() -> None:
-    """Charge le modèle au premier accès, ou un DummyModel si SKIP_MODEL_LOAD=1."""
+    """
+    Charge le modèle au premier accès, ou un DummyModel si SKIP_MODEL_LOAD=1
+    """
     global _model
     if _model is not None:
         return
@@ -71,6 +94,17 @@ def _load_model_if_needed() -> None:
         _model = _DummyModel()
     else:
         _model = joblib.load(MODEL_PATH)
+
+
+def _load_explainer_if_needed():
+    """
+    Charge l'explainer SHAP au premier acces
+    """
+    global _explainer
+    _load_model_if_needed()
+    if _explainer is None and _model is not None:
+        # donne les valeurs en proba
+        _explainer = shap.TreeExplainer(_model, model_output="probability", feature_perturbation="interventional")
 
 # FastAPI app
 app = FastAPI(
@@ -119,7 +153,9 @@ class PredictBatchResponse(BaseModel):
 
 # Helpers
 def prepare_dataframe(features: dict | list[dict]) -> Tuple[pd.DataFrame, List[str], List[str]]:
-    """Aligne les features sur EXPECTED_FEATURES, ajoute les manquantes (NaN), ignore les extra."""
+    """
+    Aligne les features sur EXPECTED_FEATURES, ajoute les manquantes (NaN), ignore les extra
+    """
     _load_meta_if_needed()
 
     if isinstance(features, dict):
@@ -225,5 +261,51 @@ def predict_batch(req: PredictBatchRequest):
                 model_version=MODEL_VERSION
             ))
         return PredictBatchResponse(results=results)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/explain", response_model=ExplainResponse)
+def explain(req: ExplainRequest):
+    try:
+        _load_metea_if_needed()
+        _load_model_if_needed()
+        _load_explainer_if_needed()
+
+        if _model is None:
+            raise RuntimeError("Modèle non chargé, (SKIP_MODEL_LOAD=1 ?)")
+        if _explainer is None:
+            raise RuntimeError("Explainer non chargé")
+        
+        X, missing, extra = prepare_dataframe(req.features)
+
+        sv = _explainer.shap_values(X)
+
+        shap_row = sv[0]
+        base_value = float(_explainer.expected_value)
+        pred = float(_model.predict_proba(X)[:, 1][0])
+
+        # table des contributions
+        feats = EXPECTED_FEATURES if EXPECTED_FEATURES else list(X.columns)
+        vals = X.iloc[0].tolist()
+        rows = []
+
+        for f, v, s in zip(feats, vals, shap_row):
+            rows.append({
+                "feature": f,
+                "value": float(v) if pd.notna(v) else None,
+                "shap": float(s),
+                "abs_shap": float(abs(s))
+            })
+        
+        rows.sort(key=lambda r: r["abs_shap"], reverse=True)
+        rows = rows[:max(1, int(req.top_k))]
+
+        return ExplainResponse(
+            base_value=base_value,
+            prediction=pred,
+            contribution=rows,
+            model_version=MODEL_VERSION,
+            threshold=THRESHOLD
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
