@@ -11,10 +11,7 @@ st.title("Credit Default Scoring - API")
 
 c1, c2 = st.columns(2)
 with c1:
-    st.markdown("""
-    Cette application Streamlit utilise l'API FastAPI pour obtenir des prédictions de défaut de crédit.
-    Teste de l'API en local ou via l'URL publique hébergée sur Render.com
-    """)
+    st.markdown("""Prediction de defaut de credit via FastAPI en local ou via l'URL render.""")
     if st.button("Ping API"):
         try:
             info = requests.get(f"{API_URL}/health", timeout=5).json()
@@ -40,6 +37,12 @@ df = load_features(FEATURES_PATH)
 ID_COL = "SK_ID_CURR"
 assert ID_COL in df.columns, f"Colonne id manquante: {ID_COL}"
 
+if ID_COL in df.columns:
+    if pd.api.types.is_float_dtype(df[ID_COL]) or pd.api.types.is_object_dtype(df[ID_COL]):
+        df[ID_COL] = pd.to_numeric(df[ID_COL], errors="coerce").astype("Int64")
+else:
+    st.error(f"Colonne id manquante: {ID_COL}")
+
 # Saisie de client_id
 client_id = st.text_input("SK_ID_CURR", value="")
 go = st.button("Prédire")
@@ -52,7 +55,7 @@ def row_to_payload(row: pd.Series) -> dict:
         if pd.isna(v):
             clean[k] = None
         elif hasattr(v, "item"):
-            clean[k] = v.item()              # numpy -> python
+            clean[k] = v.item()
         elif isinstance(v, (bool, int, float)):
             clean[k] = v
         else:
@@ -71,11 +74,13 @@ if go:
         
         row = None
         try:
-            row = df.loc[df[ID_COL] == int(client_id)]
+            df[ID_COL] = df[ID_COL].astype(str).str.strip()
+            client_id_norm = str(client_id).strip()
+            row = df.loc[df[ID_COL] == int(client_id_norm)]
             if row.empty:
-                row = df.loc[df[ID_COL].astype(str) == str(client_id)]
+                row = df.loc[df[ID_COL].astype(str) == client_id_norm]
         except Exception:
-            row = df.loc[df[ID_COL].astype(str) == str(client_id)]
+            row = df.loc[df[ID_COL].astype(str) == client_id_norm]
 
         if row is None or row.empty:
             st.error("Client introuvable.")
@@ -84,7 +89,7 @@ if go:
             payload = row_to_payload(row)
 
             try:
-                r = requests.post(f"{API_URL_LOCAL}/predict", json=payload, timeout=20)
+                r = requests.post(f"{API_URL}/predict", json=payload, timeout=20)
                 r.raise_for_status()
                 res = r.json()
 

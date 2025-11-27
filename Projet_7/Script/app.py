@@ -119,11 +119,22 @@ def _load_explainer_if_needed():
     global _explainer
     _load_model_if_needed()
     _load_meta_if_needed()
+
     if _explainer is None and _model is not None:
-        bg = _load_background_if_needed()
-        masker = shap.maskers.Independent(data=bg)
-        # donne les valeurs en proba
-        _explainer = shap.TreeExplainer(_model, masker=masker, model_output="raw", feature_perturbation="tree_path_dependent")
+        return
+
+    bg = _load_background_if_needed()
+
+    if EXPECTED_FEATURES:
+        for c in EXPECTED_FEATURES:
+            if c not in bg.columns:
+                bg[c] = np.nan
+        bg = bg[EXPECTED_FEATURES]
+    bg = bg.apply(pd.to_numeric, errors="coerce").astype(np.float32).dropna(how="all")
+
+    masker = shap.maskers.Independent(bg)
+    # donne les valeurs en proba
+    _explainer = shap.TreeExplainer(_model, masker=masker, algorithm="tree", model_output="probability", feature_perturbation="interventional")
 
 # FastAPI app
 app = FastAPI(
@@ -297,40 +308,23 @@ def explain(req: ExplainRequest):
         
         X, missing, extra = prepare_dataframe(req.features)
 
-        try:
-            exp = _explainer.shap_values(X, check_additivity=False)
-
-            shap_row = exp.values[0]
-            base_value = float(exp.base_values[0])
-
-        except Exception as e:
-            te = shap.TreeExplainer(
-                _model,
-                data=_load_background_if_needed(),
-                model_output="raw",
-                feature_perturbation="tree_path_dependent"
-            )
-
-            vals = te.shap_values(X)
-            shaop_row = np.asarray(vals[1])[0]
-            ev = te.expected_value
-            base_value = float(ev[1] if isinstance(ev, (list, np.ndarray)) else ev)
-
+        # prédiction probabilité classe "Refuser" 1
         pred = float(_model.predict_proba(X)[:, 1][0])
 
-        # table des contributions
+        exp = _explainer(X, check_additivity=False)
+        shap_row = np.array(exp.values)[0]
+        base_value = float(np.array(exp.base_values)[0])
+
         feats = EXPECTED_FEATURES if EXPECTED_FEATURES else list(X.columns)
         vals = X.iloc[0].tolist()
         rows = []
-
         for f, v, s in zip(feats, vals, shap_row):
             rows.append({
                 "feature": f,
                 "value": float(v) if pd.notna(v) else None,
                 "shap": float(s),
-                "abs_shap": float(abs(s))
+                "abs_shap": float(abs(s)),
             })
-        
         rows.sort(key=lambda r: r["abs_shap"], reverse=True)
         rows = rows[:max(1, int(req.top_k))]
 
@@ -339,7 +333,7 @@ def explain(req: ExplainRequest):
             prediction=pred,
             contribution=rows,
             model_version=MODEL_VERSION,
-            threshold=THRESHOLD
+            threshold=THRESHOLD,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
