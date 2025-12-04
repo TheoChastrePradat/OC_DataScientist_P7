@@ -1,7 +1,7 @@
 {
     "model_version": "v1",
-    "saved_at": "2025-09-26T20:11:28.606516Z",
-    "threshold": 0.23939448183975726,
+    "saved_at": "2025-12-04T00:14:00.088644Z",
+    "threshold": 0.503235268688968,
     "expected_features": [
         "NAME_CONTRACT_TYPE",
         "FLAG_OWN_CAR",
