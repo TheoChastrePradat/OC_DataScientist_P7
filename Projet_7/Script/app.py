@@ -392,7 +392,7 @@ def explain_global(top_k: int = 20):
 
 
 @app.post("/explain_local", response_model=ExplainResponse, tags=["Scoring"])
-def explain_local(req: ExplainLocalRequest):
+def explain_local(req: ExplainRequest):
     try:
         _load_meta_if_needed()
         _load_model_if_needed()
