@@ -127,15 +127,16 @@ def _load_explainer_if_needed():
     if _explainer is not None:
         return
 
-    bg = _load_background_if_needed()
-    masker = shap.maskers.Independent(bg)
-    _explainer = shap.TreeExplainer(
-        _model,
-        masker=masker,
-        algorithm="tree",
-        model_output="probability",
-        feature_perturbation="interventional",
-    )
+    _explainer = shap.TreeExplainer(_model)
+    # bg = _load_background_if_needed()
+    # masker = shap.maskers.Independent(bg)
+    # _explainer = shap.TreeExplainer(
+    #     _model,
+    #     masker=masker,
+    #     algorithm="tree",
+    #     model_output="probability",
+    #     feature_perturbation="interventional",
+    # )
 
 
 def _proba_refuser(X: pd.DataFrame) -> np.ndarray:
@@ -223,6 +224,60 @@ def prepare_dataframe(features: dict | list[dict]) -> Tuple[pd.DataFrame, List[s
 
     return df, missing, extra
 
+
+def _shap_values_and_base(X: pd.DataFrame):
+    """
+    Retourne (sv, base_value) pour la classe 1, compatible avec shap<=0.41 et >=0.46.
+    - sv est un np.ndarray shape (n_samples, n_features) en 'raw'
+    - base_value est le expected_value pour la classe 1 (si multi-classes)
+    """
+    # Certaines versions: explainer(X) → Explanation ; d'autres: shap_values(X) → array/list
+    try:
+        # nouvelle API → Explanation
+        exp = _explainer(X, check_additivity=False)
+        vals = np.array(exp.values)
+        base = exp.base_values
+        # vals: shape (n, d) pour binaire; parfois (n, d) déjà la classe 1
+        # base: scalaire ou array; harmoniser
+        if isinstance(base, (list, np.ndarray)):
+            # Multi-classes → on prend la classe 1 si présent
+            try:
+                base = float(base[1])
+            except Exception:
+                base = float(np.array(base).ravel()[0])
+        else:
+            base = float(base)
+        sv = vals
+    except Exception:
+        # ancienne API → shap_values
+        sv = _explainer.shap_values(X)  # peut renvoyer list par classe
+        base = _explainer.expected_value
+        if isinstance(sv, list):
+            # classe 1 = "mauvais"
+            sv = sv[1]
+        if isinstance(base, (list, np.ndarray)):
+            try:
+                base = float(base[1])
+            except Exception:
+                base = float(np.array(base).ravel()[0])
+        else:
+            base = float(base)
+        sv = np.array(sv)
+
+    return sv, base
+
+
+def _sanitize_row_for_shap(X_row: pd.DataFrame) -> pd.DataFrame:
+    X_row = X_row.apply(pd.to_numeric, errors="coerce").astype(np.float32)
+    try:
+        bg = _load_background_if_needed()
+        med = bg.median(numeric_only=True)
+        X_row = X_row.fillna(med)
+    except Exception:
+        X_row = X_row.fillna(0.0)
+    return X_row
+
+
 def class_label(pred_int: int) -> str:
     _load_meta_if_needed()
     # 1 -> "Refuser", 0 -> "Accepter"
@@ -242,6 +297,7 @@ def health():
         _load_model_if_needed()
     except Exception:
         pass
+    shap_ready = _explainer is not None
     return {
         "status": "ok",
         "model_version": MODEL_VERSION,
@@ -372,44 +428,58 @@ def explain(req: ExplainRequest):
 
 @app.get("/explain_global", tags=["Scoring"])
 def explain_global(top_k: int = 20):
-    """
-    Top-k importances globales (mean |SHAP|) pour la classe 1 = Refuser.
-    Essaie d'agréger depuis shap_evaluation.parquet si présent,
-    sinon calcule depuis le background (fallback).
-    """
-    global GLOBAL_MEAN_ABS
     _load_meta_if_needed()
     _load_model_if_needed()
-    _load_explainer_if_needed()
 
-    # 1) Essaye depuis shap_evaluation.parquet (si tu l'utilises)
-    if GLOBAL_MEAN_ABS is None and EVALUATION_PATH.exists():
-        try:
+    top_k = max(1, int(top_k))
+
+    # precomputed si dispo
+    try:
+        if EVALUATION_PATH.exists():
             df_eval = pd.read_parquet(EVALUATION_PATH)
             cols = {c.lower(): c for c in df_eval.columns}
             if "feature" in cols and ("mean_abs_shap" in cols or "mean_abs" in cols):
                 key = cols.get("mean_abs_shap", cols.get("mean_abs"))
                 df_eval = df_eval.rename(columns=str.lower)
-                s = pd.Series(df_eval[key].values, index=df_eval["feature"].values)
-                GLOBAL_MEAN_ABS = s.astype(float)
-        except Exception:
-            GLOBAL_MEAN_ABS = None  # on retombera sur le fallback
+                s = pd.Series(df_eval[key].values, index=df_eval["feature"].values).astype(float)
+                s = s.sort_values(ascending=False).head(top_k)
+                return {"class_explained": 1,
+                        "importances": [{"feature": k, "mean_abs_shap": float(v)} for k, v in s.items()],
+                        "source": "precomputed"}
+    except Exception:
+        pass
 
-    # 2) Fallback : calcule mean(|SHAP|) sur le background
-    if GLOBAL_MEAN_ABS is None:
+    # SHAP sur background (réduit)
+    try:
+        _load_explainer_if_needed()
         bg = _load_background_if_needed()
-        exp_bg = _explainer(bg, check_additivity=False)
-        sv = np.array(exp_bg.values)  # (n_bg, n_features)
-        mean_abs = np.abs(sv).mean(axis=0)
-        GLOBAL_MEAN_ABS = pd.Series(mean_abs, index=bg.columns)
+        if len(bg) > 500:
+            bg = bg.sample(n=500, random_state=42)
+        sv_bg, _ = _shap_values_and_base(bg)
+        mean_abs = np.abs(sv_bg).mean(axis=0)
+        s = pd.Series(mean_abs, index=bg.columns).sort_values(ascending=False).head(top_k)
+        return {"class_explained": 1,
+                "importances": [{"feature": k, "mean_abs_shap": float(v)} for k, v in s.items()],
+                "source": "shap_background"}
+    except Exception:
+        pass
 
-    top_k = max(1, int(top_k))
-    s = GLOBAL_MEAN_ABS.sort_values(ascending=False).head(top_k)
-    out = [{"feature": k, "mean_abs_shap": float(v)} for k, v in s.items()]
-    return {"class_explained": 1, "importances": out}
+    # Fallback final: feature_importances_ (approx)
+    try:
+        if hasattr(_model, "feature_importances_"):
+            imp = np.asarray(_model.feature_importances_, dtype=float)
+            idx = EXPECTED_FEATURES if EXPECTED_FEATURES else list(range(len(imp)))
+            s = pd.Series(imp, index=idx).sort_values(ascending=False).head(top_k)
+            return {"class_explained": 1,
+                    "importances": [{"feature": k, "mean_abs_shap": float(v)} for k, v in s.items()],
+                    "source": "model_feature_importances"}
+    except Exception:
+        pass
+
+    return {"class_explained": 1, "importances": [], "source": "none"}
 
 
-@app.post("/explain_local", response_model=ExplainResponse, tags=["Scoring"])
+@app.post("/explain_local", tags=["Scoring"])
 def explain_local(req: ExplainRequest):
     try:
         _load_meta_if_needed()
@@ -417,11 +487,14 @@ def explain_local(req: ExplainRequest):
         _load_explainer_if_needed()
 
         X, _, _ = prepare_dataframe(req.features)
+        X = _sanitize_row_for_shap(X)
+
+        # proba cohérente (classe 1)
         proba = float(_proba_refuser(X)[0])
 
-        exp = _explainer(X, check_additivity=False)
-        shap_row = np.array(exp.values)[0]
-        base_value = float(np.array(exp.base_values)[0])
+        # SHAP 'raw'
+        sv, base_value = _shap_values_and_base(X)
+        shap_row = sv[0]  # (n_features,)
 
         feats = EXPECTED_FEATURES if EXPECTED_FEATURES else list(X.columns)
         vals = X.iloc[0].tolist()
@@ -431,19 +504,19 @@ def explain_local(req: ExplainRequest):
             rows.append({
                 "feature": f,
                 "value": float(v) if pd.notna(v) else None,
-                "shap_value": float(s),
+                "shap_value": float(s),                      # + pousse Refuser ; - pousse Accepter
                 "abs_shap": float(abs(s)),
                 "direction": "push_refuser" if s > 0 else "push_accepter",
             })
         rows.sort(key=lambda r: r["abs_shap"], reverse=True)
         rows = rows[:max(1, int(req.top_k))]
 
-        return ExplainLocalResponse(
-            base_value=base_value,
-            probability=proba,
-            top_contributions=rows,
-            model_version=MODEL_VERSION,
-            threshold=THRESHOLD,
-        )
+        return {
+            "base_value": float(base_value),
+            "probability": proba,
+            "top_contributions": rows,
+            "model_version": MODEL_VERSION,
+            "threshold": THRESHOLD,
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
