@@ -225,46 +225,40 @@ def prepare_dataframe(features: dict | list[dict]) -> Tuple[pd.DataFrame, List[s
     return df, missing, extra
 
 
-def _shap_values_and_base(X: pd.DataFrame):
+def _shap_values_and_base(X: pd.DataFrame)-> tuple[np.ndarray, float]:
     """
-    Retourne (sv, base_value) pour la classe 1, compatible avec shap<=0.41 et >=0.46.
-    - sv est un np.ndarray shape (n_samples, n_features) en 'raw'
-    - base_value est le expected_value pour la classe 1 (si multi-classes)
+    Return (sv, base_value) for class=1 in a version-agnostic way.
+
+    sv : (n_samples, n_features) raw SHAP values
+    base_value : scalar float (flattened)
     """
-    # Certaines versions: explainer(X) → Explanation ; d'autres: shap_values(X) → array/list
+    # New API path
     try:
-        # nouvelle API → Explanation
         exp = _explainer(X, check_additivity=False)
         vals = np.array(exp.values)
         base = exp.base_values
-        # vals: shape (n, d) pour binaire; parfois (n, d) déjà la classe 1
-        # base: scalaire ou array; harmoniser
-        if isinstance(base, (list, np.ndarray)):
-            # Multi-classes → on prend la classe 1 si présent
-            try:
-                base = float(base[1])
-            except Exception:
-                base = float(np.array(base).ravel()[0])
-        else:
-            base = float(base)
-        sv = vals
-    except Exception:
-        # ancienne API → shap_values
-        sv = _explainer.shap_values(X)  # peut renvoyer list par classe
-        base = _explainer.expected_value
-        if isinstance(sv, list):
-            # classe 1 = "mauvais"
-            sv = sv[1]
-        if isinstance(base, (list, np.ndarray)):
-            try:
-                base = float(base[1])
-            except Exception:
-                base = float(np.array(base).ravel()[0])
-        else:
-            base = float(base)
-        sv = np.array(sv)
 
-    return sv, base
+        # vals can be (n, d) or (n, d, C). If 3D, select class=1.
+        if vals.ndim == 3:
+            # shape: (n_samples, n_features, n_classes)
+            cidx = 1 if vals.shape[-1] > 1 else 0
+            vals = vals[:, :, cidx]
+
+        sv = vals  # now (n, d)
+        base_value = _flatten_scalar(base)  # robust scalar
+        return sv, base_value
+    except Exception:
+        # Old API path
+        sv_any = _explainer.shap_values(X)  # list per class or ndarray
+        base_any = _explainer.expected_value
+
+        if isinstance(sv_any, list):
+            sv = np.array(sv_any[1] if len(sv_any) > 1 else sv_any[0])
+        else:
+            sv = np.array(sv_any)
+
+        base_value = _flatten_scalar(base_any)
+        return sv, base_value
 
 
 def _sanitize_row_for_shap(X_row: pd.DataFrame) -> pd.DataFrame:
@@ -276,6 +270,14 @@ def _sanitize_row_for_shap(X_row: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         X_row = X_row.fillna(0.0)
     return X_row
+
+
+def _flatten_scalar(x) -> float:
+    """
+    Turn anything (scalar/list/np.ndarray) into a single float by flattening and taking [0].
+    """
+    arr = np.array(x)
+    return float(arr.reshape(-1)[0])
 
 
 def class_label(pred_int: int) -> str:
@@ -433,7 +435,7 @@ def explain_global(top_k: int = 20):
 
     top_k = max(1, int(top_k))
 
-    # precomputed si dispo
+    # 1) precomputed
     try:
         if EVALUATION_PATH.exists():
             df_eval = pd.read_parquet(EVALUATION_PATH)
@@ -449,13 +451,13 @@ def explain_global(top_k: int = 20):
     except Exception:
         pass
 
-    # SHAP sur background (réduit)
+    # 2) SHAP on background (reduced), using the same extractor
     try:
         _load_explainer_if_needed()
         bg = _load_background_if_needed()
         if len(bg) > 500:
             bg = bg.sample(n=500, random_state=42)
-        sv_bg, _ = _shap_values_and_base(bg)
+        sv_bg, _ = _extract_shap_for_class1(bg)  # (n_bg, n_features)
         mean_abs = np.abs(sv_bg).mean(axis=0)
         s = pd.Series(mean_abs, index=bg.columns).sort_values(ascending=False).head(top_k)
         return {"class_explained": 1,
@@ -464,7 +466,7 @@ def explain_global(top_k: int = 20):
     except Exception:
         pass
 
-    # Fallback final: feature_importances_ (approx)
+    # 3) Model feature_importances_ fallback (approx)
     try:
         if hasattr(_model, "feature_importances_"):
             imp = np.asarray(_model.feature_importances_, dtype=float)
@@ -489,30 +491,31 @@ def explain_local(req: ExplainRequest):
         X, _, _ = prepare_dataframe(req.features)
         X = _sanitize_row_for_shap(X)
 
-        # proba cohérente (classe 1)
+        # Probability for class=1 (decision still based on threshold)
         proba = float(_proba_refuser(X)[0])
 
-        # SHAP 'raw'
-        sv, base_value = _shap_values_and_base(X)
-        shap_row = sv[0]  # (n_features,)
+        # SHAP raw values (robust across versions)
+        sv, base_value = _extract_shap_for_class1(X)   # sv: (1, n_features)
+        shap_row = sv[0]                                # 1D length n_features
 
         feats = EXPECTED_FEATURES if EXPECTED_FEATURES else list(X.columns)
         vals = X.iloc[0].tolist()
 
         rows = []
         for f, v, s in zip(feats, vals, shap_row):
+            s = float(s)
             rows.append({
                 "feature": f,
-                "value": float(v) if pd.notna(v) else None,
-                "shap_value": float(s),                      # + pousse Refuser ; - pousse Accepter
-                "abs_shap": float(abs(s)),
+                "value": None if pd.isna(v) else float(v),
+                "shap_value": s,                         # + pushes to Refuser, - to Accepter
+                "abs_shap": abs(s),
                 "direction": "push_refuser" if s > 0 else "push_accepter",
             })
         rows.sort(key=lambda r: r["abs_shap"], reverse=True)
         rows = rows[:max(1, int(req.top_k))]
 
         return {
-            "base_value": float(base_value),
+            "base_value": _flatten_scalar(base_value),   # safe scalar
             "probability": proba,
             "top_contributions": rows,
             "model_version": MODEL_VERSION,
