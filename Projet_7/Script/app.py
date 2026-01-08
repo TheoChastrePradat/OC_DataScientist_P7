@@ -137,7 +137,6 @@ def _load_explainer_if_needed():
     )
 
 
-
 def _proba_refuser(X: pd.DataFrame) -> np.ndarray:
     """
     Retourne p(y=1) (classe 'Refuser'), en sélectionnant la bonne colonne
