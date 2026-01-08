@@ -16,9 +16,10 @@ from pydantic import BaseModel, Field
 from typing import Optional, Tuple, List, Dict, Any
 
 # Config & chemins artefacts
-ART_DIR      = Path(os.getenv("ART_DIR", "artifacts"))
-MODEL_PATH   = Path(os.getenv("MODEL_PATH", ART_DIR / "model.joblib"))
-META_PATH    = Path(os.getenv("ARTIFACTS_PATH", ART_DIR / "artifacts.json"))
+BASE_DIR = Path(__file__).resolve().parent
+ART_DIR  = Path(os.getenv("ART_DIR", str(BASE_DIR / "artifacts")))
+MODEL_PATH = Path(os.getenv("MODEL_PATH", str(ART_DIR / "model.joblib")))
+META_PATH  = Path(os.getenv("ARTIFACTS_PATH", str(ART_DIR / "artifacts.json")))
 OVERRIDE_THR = os.getenv("THRESHOLD")
 SKIP_MODEL   = os.getenv("SKIP_MODEL_LOAD", "0") == "1"  # utile pour la CI
 BG_PATH = ART_DIR / "shap_background.parquet"
@@ -251,7 +252,21 @@ def health():
         "meta_path": str(META_PATH),
         "skip_model_load": SKIP_MODEL,
         "model_loaded": _model is not None,
+        "paths": {
+            "base_dir": str(BASE_DIR),
+            "art_dir": str(ART_DIR),
+            "model_path": str(MODEL_PATH),
+            "meta_path": str(META_PATH),
+            "bg_path": str(BG_PATH),
+        },
+        "exists": {
+            "art_dir": ART_DIR.exists(),
+            "model": MODEL_PATH.exists(),
+            "meta": META_PATH.exists(),
+            "bg": BG_PATH.exists(),
+        }
     }
+
 
 @app.get("/metadata")
 def metadata():
@@ -263,6 +278,7 @@ def metadata():
         "expected_features": EXPECTED_FEATURES, # ordre exact d’entraînement
         "class_mapping": CLASS_MAPPING,
     }
+
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
@@ -308,6 +324,7 @@ def predict_batch(req: PredictBatchRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
 @app.post("/explain", response_model=ExplainResponse, tags=["Scoring"])
 def explain(req: ExplainRequest):
     try:
@@ -351,6 +368,7 @@ def explain(req: ExplainRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
 
 @app.get("/explain_global", tags=["Scoring"])
 def explain_global(top_k: int = 20):
