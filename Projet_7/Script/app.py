@@ -457,7 +457,7 @@ def explain_global(top_k: int = 20):
         bg = _load_background_if_needed()
         if len(bg) > 500:
             bg = bg.sample(n=500, random_state=42)
-        sv_bg, _ = _extract_shap_for_class1(bg)  # (n_bg, n_features)
+        sv_bg, _ = _shap_values_and_base(bg)  # (n_bg, n_features)
         mean_abs = np.abs(sv_bg).mean(axis=0)
         s = pd.Series(mean_abs, index=bg.columns).sort_values(ascending=False).head(top_k)
         return {"class_explained": 1,
