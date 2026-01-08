@@ -22,6 +22,7 @@ META_PATH    = Path(os.getenv("ARTIFACTS_PATH", ART_DIR / "artifacts.json"))
 OVERRIDE_THR = os.getenv("THRESHOLD")
 SKIP_MODEL   = os.getenv("SKIP_MODEL_LOAD", "0") == "1"  # utile pour la CI
 BG_PATH = ART_DIR / "shap_background.parquet"
+EVALUATION_PATH = ART_DIR / "shap_evaluation.parquet"
 
 _explainer = None
 
@@ -56,6 +57,7 @@ EXPECTED_FEATURES: List[str] = []
 THRESHOLD: float = 0.5
 MODEL_VERSION: str = "v1"
 CLASS_MAPPING: Dict[str, int] = {"Accepter": 0, "Refuser": 1}
+GLOBAL_MEAN_ABS = None
 
 def _load_meta_if_needed() -> None:
     """
@@ -101,7 +103,7 @@ def _load_background_if_needed() -> pd.DataFrame:
     Charge le dataset de background pour SHAP
     """
     if BG_PATH.exists():
-        bg = pd.read_parquet(BG_PATH)
+        bg = pd.read_parquet(BG_PATH)[EXPECTED_FEATURES]
 
         for c in EXPECTED_FEATURES:
             if c not in bg.columns:
@@ -124,17 +126,28 @@ def _load_explainer_if_needed():
         return
 
     bg = _load_background_if_needed()
-
-    if EXPECTED_FEATURES:
-        for c in EXPECTED_FEATURES:
-            if c not in bg.columns:
-                bg[c] = np.nan
-        bg = bg[EXPECTED_FEATURES]
-    bg = bg.apply(pd.to_numeric, errors="coerce").astype(np.float32).dropna(how="all")
-
+    # masque stable + sortie en probas
     masker = shap.maskers.Independent(bg)
-    # donne les valeurs en proba
-    _explainer = shap.TreeExplainer(_model, masker=masker, algorithm="tree", model_output="probability", feature_perturbation="interventional")
+    _explainer = shap.TreeExplainer(
+        _model,
+        masker=masker,
+        algorithm="tree",
+        model_output="probability",
+        feature_perturbation="interventional",
+    )
+
+
+def _proba_refuser(X: pd.DataFrame) -> np.ndarray:
+    """
+    Retourne p(y=1) en sélectionnant la bonne colonne selon model.classes_.
+    """
+     proba = _model.predict_proba(X)
+     if hasattr(_model, "classes_"):
+        import numpy as np
+        idx1 = int(np.where(_model.classes_ == 1)[0][0])
+    else:
+        idx1 = 1
+    return proba[:, idx1]
 
 # FastAPI app
 app = FastAPI(
@@ -256,7 +269,7 @@ def predict(req: PredictRequest):
         _load_meta_if_needed()
         _load_model_if_needed()
         X, missing, extra = prepare_dataframe(req.features)
-        proba_bad = float(_model.predict_proba(X)[:, 1][0])   # colonne 1 = classe "Refuser"
+        proba_bad = float(_proba_refuser(X)[0])   # colonne 1 = classe "Refuser"
         yhat = int(proba_bad >= THRESHOLD) # 1 = Refuser, 0 = Accepter
         return PredictResponse(
             probability=proba_bad,
@@ -276,7 +289,7 @@ def predict_batch(req: PredictBatchRequest):
         _load_meta_if_needed()
         _load_model_if_needed()
         X, missing, extra = prepare_dataframe(req.rows)
-        probas = _model.predict_proba(X)[:, 1]
+        probas = _proba_refuser(X)
         preds = (probas >= THRESHOLD).astype(int)
 
         results = []
@@ -294,7 +307,7 @@ def predict_batch(req: PredictBatchRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/explain", response_model=ExplainResponse)
+@app.post("/explain", response_model=ExplainResponse, tags=["Scoring"])
 def explain(req: ExplainRequest):
     try:
         _load_meta_if_needed()
@@ -332,6 +345,84 @@ def explain(req: ExplainRequest):
             base_value=base_value,
             prediction=pred,
             contribution=rows,
+            model_version=MODEL_VERSION,
+            threshold=THRESHOLD,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/explain_global", tags=["Scoring"])
+def explain_global(top_k: int = 20):
+     """
+    Retourne top-k importances globales (mean |SHAP|) pour la classe 1 = Refuser.
+    Essaie d'agréger depuis shap_evaluation.parquet s'il existe.
+    Si non calcule depuis le background (plus lent mais OK).
+    """
+    global GLOBAL_MEAN_ABS
+    _load_meta_if_needed()
+    _load_model_if_needed()
+    _load_explainer_if_needed()
+
+    try:
+        if EVALUATION_PATH.exists():
+            df_eval = pd.read_parquet(EVALUATION_PATH)
+            cand_cols = [c.lower() for c in df_eval.columns]
+            if "feature" in cand_cols and ("mean_abs_shap" in cand_cols or "mean_abs" in cand_cols):
+                # normalise les noms
+                cols_map = {c: c.lower() for c in df_eval.columns}
+                df_eval = df_eval.rename(columns=cols_map)
+                key_val = "mean_abs_shap" if "mean_abs_shap" in df_eval.columns else "mean_abs"
+                s = pd.Series(df_eval[key_val].values, index=df_eval["feature"].values)
+                GLOBAL_MEAN_ABS = s.astype(float)
+    except Exception:
+        pass
+
+    if GLOBAL_MEAN_ABS is None:
+        bg = _load_background_if_needed()
+        exp_bg = _explainer(bg, check_additivity=False)
+        sv = np.array(exp_bg.values)
+        mean_abs = np.abs(sv).mean(axis=0)
+        GLOBAL_MEAN_ABS = pd.Series(mean_abs, index=bg.columns)
+    
+    top_k = max(1, int(top_k))
+    s = GLOBAL_MEAN_ABS.sort_values(ascending=False).head(top_k)
+    out = [{"feature": k, "mean_abs_shap": float(v)} for k, v in s.items()]
+    return {"class_explained": 1, "importances": out}
+
+
+@app.post("/explain_local", response_model=ExplainResponse, tags=["Scoring"])
+def explain_local(req: ExplainLocalRequest):
+    try:
+        _load_meta_if_needed()
+        _load_model_if_needed()
+        _load_explainer_if_needed()
+
+        X, _, _ = prepare_dataframe(req.features)
+        proba = float(_proba_refuser(X)[0])
+
+        exp = _explainer(X, check_additivity=False)
+        shap_row = np.array(exp.values)[0]
+        base_value = float(np.array(exp.base_values)[0])
+
+        feats = EXPECTED_FEATURES if EXPECTED_FEATURES else list(X.columns)
+        vals = X.iloc[0].tolist()
+
+        rows = []
+        for f, v, s in zip(feats, vals, shap_row):
+            rows.append({
+                "feature": f,
+                "value": float(v) if pd.notna(v) else None,
+                "shap_value": float(s),
+                "abs_shap": float(abs(s)),
+                "direction": "push_refuser" if s > 0 else "push_accepter",
+            })
+        rows.sort(key=lambda r: r["abs_shap"], reverse=True)
+        rows = rows[:max(1, int(req.top_k))]
+
+        return ExplainLocalResponse(
+            base_value=base_value,
+            probability=proba,
+            top_contributions=rows,
             model_version=MODEL_VERSION,
             threshold=THRESHOLD,
         )
