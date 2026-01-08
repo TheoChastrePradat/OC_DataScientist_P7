@@ -355,37 +355,37 @@ def explain(req: ExplainRequest):
 
 @app.get("/explain_global", tags=["Scoring"])
 def explain_global(top_k: int = 20):
-     """
-    Retourne top-k importances globales (mean |SHAP|) pour la classe 1 = Refuser.
-    Essaie d'agréger depuis shap_evaluation.parquet s'il existe.
-    Si non calcule depuis le background (plus lent mais OK).
+    """
+    Top-k importances globales (mean |SHAP|) pour la classe 1 = Refuser.
+    Essaie d'agréger depuis shap_evaluation.parquet si présent,
+    sinon calcule depuis le background (fallback).
     """
     global GLOBAL_MEAN_ABS
     _load_meta_if_needed()
     _load_model_if_needed()
     _load_explainer_if_needed()
 
-    try:
-        if EVALUATION_PATH.exists():
+    # 1) Essaye depuis shap_evaluation.parquet (si tu l'utilises)
+    if GLOBAL_MEAN_ABS is None and EVALUATION_PATH.exists():
+        try:
             df_eval = pd.read_parquet(EVALUATION_PATH)
-            cand_cols = [c.lower() for c in df_eval.columns]
-            if "feature" in cand_cols and ("mean_abs_shap" in cand_cols or "mean_abs" in cand_cols):
-                # normalise les noms
-                cols_map = {c: c.lower() for c in df_eval.columns}
-                df_eval = df_eval.rename(columns=cols_map)
-                key_val = "mean_abs_shap" if "mean_abs_shap" in df_eval.columns else "mean_abs"
-                s = pd.Series(df_eval[key_val].values, index=df_eval["feature"].values)
+            cols = {c.lower(): c for c in df_eval.columns}
+            if "feature" in cols and ("mean_abs_shap" in cols or "mean_abs" in cols):
+                key = cols.get("mean_abs_shap", cols.get("mean_abs"))
+                df_eval = df_eval.rename(columns=str.lower)
+                s = pd.Series(df_eval[key].values, index=df_eval["feature"].values)
                 GLOBAL_MEAN_ABS = s.astype(float)
-    except Exception:
-        pass
+        except Exception:
+            GLOBAL_MEAN_ABS = None  # on retombera sur le fallback
 
+    # 2) Fallback : calcule mean(|SHAP|) sur le background
     if GLOBAL_MEAN_ABS is None:
         bg = _load_background_if_needed()
         exp_bg = _explainer(bg, check_additivity=False)
-        sv = np.array(exp_bg.values)
+        sv = np.array(exp_bg.values)  # (n_bg, n_features)
         mean_abs = np.abs(sv).mean(axis=0)
         GLOBAL_MEAN_ABS = pd.Series(mean_abs, index=bg.columns)
-    
+
     top_k = max(1, int(top_k))
     s = GLOBAL_MEAN_ABS.sort_values(ascending=False).head(top_k)
     out = [{"feature": k, "mean_abs_shap": float(v)} for k, v in s.items()]
