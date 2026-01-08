@@ -114,19 +114,19 @@ def _load_background_if_needed() -> pd.DataFrame:
     med = pd.Series({c: 0.0 for c in EXPECTED_FEATURES}, dtype=np.float32)
     return pd.DataFrame([med])[EXPECTED_FEATURES]
 
+
 def _load_explainer_if_needed():
     """
-    Charge l'explainer SHAP au premier acces
+    Charge l'explainer SHAP au premier accès.
     """
     global _explainer
     _load_model_if_needed()
     _load_meta_if_needed()
 
-    if _explainer is None and _model is not None:
+    if _explainer is not None:
         return
 
     bg = _load_background_if_needed()
-    # masque stable + sortie en probas
     masker = shap.maskers.Independent(bg)
     _explainer = shap.TreeExplainer(
         _model,
@@ -137,17 +137,19 @@ def _load_explainer_if_needed():
     )
 
 
+
 def _proba_refuser(X: pd.DataFrame) -> np.ndarray:
     """
-    Retourne p(y=1) en sélectionnant la bonne colonne selon model.classes_.
+    Retourne p(y=1) (classe 'Refuser'), en sélectionnant la bonne colonne
+    selon model.classes_.
     """
-     proba = _model.predict_proba(X)
-     if hasattr(_model, "classes_"):
-        import numpy as np
+    proba = _model.predict_proba(X)
+    if hasattr(_model, "classes_"):
         idx1 = int(np.where(_model.classes_ == 1)[0][0])
     else:
-        idx1 = 1
+        idx1 = 1  # fallback
     return proba[:, idx1]
+
 
 # FastAPI app
 app = FastAPI(
@@ -322,7 +324,7 @@ def explain(req: ExplainRequest):
         X, missing, extra = prepare_dataframe(req.features)
 
         # prédiction probabilité classe "Refuser" 1
-        pred = float(_model.predict_proba(X)[:, 1][0])
+        pred = float(_proba_refuser(X)[0])
 
         exp = _explainer(X, check_additivity=False)
         shap_row = np.array(exp.values)[0]
