@@ -495,7 +495,7 @@ def explain_local(req: ExplainRequest):
         proba = float(_proba_refuser(X)[0])
 
         # SHAP raw values (robust across versions)
-        sv, base_value = _extract_shap_for_class1(X)   # sv: (1, n_features)
+        sv, base_value = _shap_values_and_base(X)   # sv: (1, n_features)
         shap_row = sv[0]                                # 1D length n_features
 
         feats = EXPECTED_FEATURES if EXPECTED_FEATURES else list(X.columns)
