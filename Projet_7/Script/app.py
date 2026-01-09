@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import os
+import time
 import shap
 import json
 import joblib
@@ -59,6 +60,9 @@ THRESHOLD: float = 0.5
 MODEL_VERSION: str = "v1"
 CLASS_MAPPING: Dict[str, int] = {"Accepter": 0, "Refuser": 1}
 GLOBAL_MEAN_ABS = None
+GLOBAL_MEAN_ABS_TSTAMP = 0.0
+GLOBAL_TTL_SECONDS = 600
+MAX_BG_FOR_SHAP = 200
 
 def _load_meta_if_needed() -> None:
     """
@@ -110,6 +114,8 @@ def _load_background_if_needed() -> pd.DataFrame:
             if c not in bg.columns:
                 bg[c] = np.nan
         bg = bg[EXPECTED_FEATURES].apply(pd.to_numeric, errors="coerce").astype(np.float32)
+        if len(bg) > MAX_BG_FOR_SHAP:
+            bg = bg.sample(n=MAX_BG_FOR_SHAP, random_state=42)
         return bg
     
     med = pd.Series({c: 0.0 for c in EXPECTED_FEATURES}, dtype=np.float32)
@@ -434,8 +440,17 @@ def explain_global(top_k: int = 20):
     _load_model_if_needed()
 
     top_k = max(1, int(top_k))
+    now = time.time()
 
-    # 1) precomputed
+    # 0) Si on a un cache frais, renvoie-le instantanément
+    global GLOBAL_MEAN_ABS, GLOBAL_MEAN_ABS_TSTAMP
+    if GLOBAL_MEAN_ABS is not None and (now - GLOBAL_MEAN_ABS_TSTAMP) < GLOBAL_TTL_SECONDS:
+        s = GLOBAL_MEAN_ABS.sort_values(ascending=False).head(top_k)
+        return {"class_explained": 1,
+                "importances": [{"feature": k, "mean_abs_shap": float(v)} for k, v in s.items()],
+                "source": "cache"}
+
+    # 1) precomputed s'il existe
     try:
         if EVALUATION_PATH.exists():
             df_eval = pd.read_parquet(EVALUATION_PATH)
@@ -444,36 +459,42 @@ def explain_global(top_k: int = 20):
                 key = cols.get("mean_abs_shap", cols.get("mean_abs"))
                 df_eval = df_eval.rename(columns=str.lower)
                 s = pd.Series(df_eval[key].values, index=df_eval["feature"].values).astype(float)
-                s = s.sort_values(ascending=False).head(top_k)
+                GLOBAL_MEAN_ABS = s
+                GLOBAL_MEAN_ABS_TSTAMP = time.time()
+                s2 = s.sort_values(ascending=False).head(top_k)
                 return {"class_explained": 1,
-                        "importances": [{"feature": k, "mean_abs_shap": float(v)} for k, v in s.items()],
+                        "importances": [{"feature": k, "mean_abs_shap": float(v)} for k, v in s2.items()],
                         "source": "precomputed"}
     except Exception:
         pass
 
-    # 2) SHAP on background (reduced), using the same extractor
+    # 2) SHAP sur background réduit + mise en cache
     try:
         _load_explainer_if_needed()
-        bg = _load_background_if_needed()
-        if len(bg) > 500:
-            bg = bg.sample(n=500, random_state=42)
-        sv_bg, _ = _shap_values_and_base(bg)  # (n_bg, n_features)
+        bg = _load_background_if_needed()  # déjà réduit à MAX_BG_FOR_SHAP
+        sv_bg, _ = _extract_shap_for_class1(bg)  # robuste à la version SHAP
         mean_abs = np.abs(sv_bg).mean(axis=0)
-        s = pd.Series(mean_abs, index=bg.columns).sort_values(ascending=False).head(top_k)
+        s = pd.Series(mean_abs, index=bg.columns)
+        GLOBAL_MEAN_ABS = s
+        GLOBAL_MEAN_ABS_TSTAMP = time.time()
+        s2 = s.sort_values(ascending=False).head(top_k)
         return {"class_explained": 1,
-                "importances": [{"feature": k, "mean_abs_shap": float(v)} for k, v in s.items()],
+                "importances": [{"feature": k, "mean_abs_shap": float(v)} for k, v in s2.items()],
                 "source": "shap_background"}
     except Exception:
         pass
 
-    # 3) Model feature_importances_ fallback (approx)
+    # 3) Fallback instantané: feature_importances_
     try:
         if hasattr(_model, "feature_importances_"):
             imp = np.asarray(_model.feature_importances_, dtype=float)
             idx = EXPECTED_FEATURES if EXPECTED_FEATURES else list(range(len(imp)))
-            s = pd.Series(imp, index=idx).sort_values(ascending=False).head(top_k)
+            s = pd.Series(imp, index=idx)
+            GLOBAL_MEAN_ABS = s
+            GLOBAL_MEAN_ABS_TSTAMP = time.time()
+            s2 = s.sort_values(ascending=False).head(top_k)
             return {"class_explained": 1,
-                    "importances": [{"feature": k, "mean_abs_shap": float(v)} for k, v in s.items()],
+                    "importances": [{"feature": k, "mean_abs_shap": float(v)} for k, v in s2.items()],
                     "source": "model_feature_importances"}
     except Exception:
         pass
